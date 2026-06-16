@@ -9,7 +9,7 @@ from .participant import (
 )
 from .timeout import TimeoutDetector
 from .manager import TransactionManager, TransactionError
-from .recovery import RecoveryManager, RecoveryResult
+from .recovery import RecoveryManager, RecoveryResult, RecoveryOutcome
 
 __all__ = [
     "TransactionLog",
@@ -29,4 +29,5 @@ __all__ = [
     "TransactionError",
     "RecoveryManager",
     "RecoveryResult",
+    "RecoveryOutcome",
 ]

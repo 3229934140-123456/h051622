@@ -132,26 +132,29 @@ class TransactionManager:
             participant = self._participants.get(prec.participant_id)
             if not participant:
                 prec.vote = Vote.NO
+                self._tx_logger.append(log)
                 all_yes = False
                 logger.error(
-                    "Participant not found during prepare: %s", prec.participant_id
+                    "Participant not found during prepare: %s (logged NO)", prec.participant_id
                 )
                 continue
 
             try:
                 vote = await participant.prepare(tx_id, context)
                 prec.vote = vote
+                self._tx_logger.append(log)
                 logger.info(
-                    "Prepare vote: tx=%s participant=%s vote=%s",
+                    "Prepare vote: tx=%s participant=%s vote=%s (logged)",
                     tx_id,
                     prec.participant_id,
                     vote.value,
                 )
             except Exception as exc:
                 prec.vote = Vote.NO
+                self._tx_logger.append(log)
                 all_yes = False
                 logger.error(
-                    "Prepare error: tx=%s participant=%s error=%s",
+                    "Prepare error: tx=%s participant=%s error=%s (logged NO)",
                     tx_id,
                     prec.participant_id,
                     exc,
@@ -290,34 +293,38 @@ class TransactionManager:
             participant = self._participants.get(prec.participant_id)
             if not participant:
                 prec.vote = Vote.NO
+                self._tx_logger.append(log)
                 all_yes = False
                 logger.error(
-                    "Participant not found during try: %s", prec.participant_id
+                    "Participant not found during try: %s (logged NO)", prec.participant_id
                 )
                 continue
 
             if not isinstance(participant, TCCParticipant):
                 prec.vote = Vote.NO
+                self._tx_logger.append(log)
                 all_yes = False
                 logger.error(
-                    "Participant is not TCC-capable: %s", prec.participant_id
+                    "Participant is not TCC-capable: %s (logged NO)", prec.participant_id
                 )
                 continue
 
             try:
                 vote = await participant.try_phase(tx_id, context)
                 prec.vote = vote
+                self._tx_logger.append(log)
                 logger.info(
-                    "Try vote: tx=%s participant=%s vote=%s",
+                    "Try vote: tx=%s participant=%s vote=%s (logged)",
                     tx_id,
                     prec.participant_id,
                     vote.value,
                 )
             except Exception as exc:
                 prec.vote = Vote.NO
+                self._tx_logger.append(log)
                 all_yes = False
                 logger.error(
-                    "Try error: tx=%s participant=%s error=%s",
+                    "Try error: tx=%s participant=%s error=%s (logged NO)",
                     tx_id,
                     prec.participant_id,
                     exc,

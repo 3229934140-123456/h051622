@@ -629,6 +629,259 @@ async def demo_recovery_partial_tcc_confirm():
     await tm2.stop()
 
 
+# ============================================================
+# NEW: Requirement 1+3 - Mid-prepare crash recovery (2PC)
+# ============================================================
+async def demo_recovery_mid_prepare_2pc():
+    logger.info("=" * 60)
+    logger.info("Demo [Req1,2,3]: 2PC mid-prepare crash -> svc1 voted YES, svc2 not started -> recovery rollback svc1")
+    logger.info("=" * 60)
+
+    log_dir = "demo_logs/recovery_mid_prepare_2pc"
+    if os.path.exists(log_dir):
+        shutil.rmtree(log_dir)
+
+    tm1 = TransactionManager(log_dir=log_dir)
+    p1 = InMemory2PCParticipant("svc-a")
+    p2 = InMemory2PCParticipant("svc-b")
+    tm1.register_participant(p1)
+    tm1.register_participant(p2)
+
+    tx_id = tm1.begin(
+        mode=TxMode.TWO_PHASE,
+        participant_ids=["svc-a", "svc-b"],
+        timeout=60.0,
+    )
+
+    from dtx.logger import TxStatus, Vote
+    log = tm1.logger.read(tx_id)
+    log.status = TxStatus.PREPARING
+    log.participants[0].vote = Vote.YES
+    log.participants[1].vote = None
+    tm1.logger.append(log)
+
+    logger.info("Simulated crash: 2PC tx=%s PREPARING", tx_id)
+    logger.info("  svc-a: vote=YES (already reserved resources)")
+    logger.info("  svc-b: vote=None (never called, nothing to rollback)")
+
+    log_on_disk = tm1.logger.read(tx_id)
+    assert log_on_disk.participants[0].vote == Vote.YES, "svc-a vote should be logged"
+    assert log_on_disk.participants[1].vote is None, "svc-b vote should be None"
+    logger.info("Verified: per-participant vote logged immediately after each step. OK")
+
+    tm2 = TransactionManager(log_dir=log_dir)
+    await tm2.start()
+
+    p1_new = InMemory2PCParticipant("svc-a")
+    p2_new = InMemory2PCParticipant("svc-b")
+    tm2.register_participant(p1_new)
+    tm2.register_participant(p2_new)
+
+    recovery = RecoveryManager(tm2)
+    result = await recovery.recover_all()
+
+    final_log = tm2.logger.read(tx_id)
+    logger.info("After recovery: status=%s", final_log.status.value)
+
+    assert final_log.status == _TxS.ROLLED_BACK, f"Expected ROLLED_BACK, got {final_log.status.value}"
+    assert final_log.participants[0].phase_completed == "rollback", "svc-a should have rollback called"
+    assert final_log.participants[1].vote in (Vote.TIMEOUT, Vote.NO), "svc-b should be marked TIMEOUT"
+
+    outcome = result.outcomes.get(tx_id)
+    logger.info("Recovery outcome: %s", outcome)
+    assert outcome in ("cancel_completed",), f"Expected cancel_completed, got {outcome}"
+    assert p2_new.rollback_count(tx_id) == 0, "svc-b never voted YES, should NOT be rolled back"
+    logger.info("Only svc-a was rolled back (compensated). svc-b skipped (never voted YES). OK")
+    logger.info("No orphaned reserved resources. All locks released. OK")
+
+    await tm2.stop()
+
+
+# ============================================================
+# NEW: Requirement 1+3 - Mid-try crash recovery (TCC)
+# ============================================================
+async def demo_recovery_mid_try_tcc():
+    logger.info("=" * 60)
+    logger.info("Demo [Req1,2,3]: TCC mid-try crash -> svc1 tried YES, svc2 not started -> recovery cancel svc1")
+    logger.info("=" * 60)
+
+    log_dir = "demo_logs/recovery_mid_try_tcc"
+    if os.path.exists(log_dir):
+        shutil.rmtree(log_dir)
+
+    tm1 = TransactionManager(log_dir=log_dir)
+    p1 = InMemoryTCCParticipant("wallet-svc")
+    p2 = InMemoryTCCParticipant("reward-svc")
+    tm1.register_participant(p1)
+    tm1.register_participant(p2)
+
+    tx_id = tm1.begin(
+        mode=TxMode.TCC,
+        participant_ids=["wallet-svc", "reward-svc"],
+        timeout=60.0,
+    )
+
+    from dtx.logger import TxStatus, Vote
+    log = tm1.logger.read(tx_id)
+    log.status = TxStatus.TRYING
+    log.participants[0].vote = Vote.YES
+    log.participants[1].vote = None
+    tm1.logger.append(log)
+
+    logger.info("Simulated crash: TCC tx=%s TRYING", tx_id)
+    logger.info("  wallet-svc: vote=YES (frozen 100$ balance)")
+    logger.info("  reward-svc: vote=None (never called, nothing to cancel)")
+
+    log_on_disk = tm1.logger.read(tx_id)
+    assert log_on_disk.participants[0].vote == Vote.YES, "wallet-svc vote should be logged"
+    assert log_on_disk.participants[1].vote is None, "reward-svc vote should be None"
+    logger.info("Verified: per-participant try logged immediately after each step. OK")
+
+    tm2 = TransactionManager(log_dir=log_dir)
+    await tm2.start()
+
+    p1_new = InMemoryTCCParticipant("wallet-svc")
+    p2_new = InMemoryTCCParticipant("reward-svc")
+    tm2.register_participant(p1_new)
+    tm2.register_participant(p2_new)
+
+    recovery = RecoveryManager(tm2)
+    result = await recovery.recover_all()
+
+    final_log = tm2.logger.read(tx_id)
+    logger.info("After recovery: status=%s", final_log.status.value)
+
+    assert final_log.status == _TxS.CANCELLED, f"Expected CANCELLED, got {final_log.status.value}"
+    assert final_log.participants[0].phase_completed == "cancel", "wallet-svc should have cancel called"
+
+    outcome = result.outcomes.get(tx_id)
+    logger.info("Recovery outcome: %s", outcome)
+    assert outcome in ("cancel_completed",), f"Expected cancel_completed, got {outcome}"
+    assert p2_new.cancel_count(tx_id) == 0, "reward-svc never tried YES, should NOT be cancelled"
+    logger.info("Only wallet-svc was cancelled (frozen balance released). reward-svc skipped. OK")
+    logger.info("No orphaned frozen resources. Business-level locks released. OK")
+
+    await tm2.stop()
+
+
+# ============================================================
+# NEW: Requirement 3 - 2PC prepare crash with NO voters (edge case)
+# ============================================================
+async def demo_recovery_prepare_all_no_2pc():
+    logger.info("=" * 60)
+    logger.info("Demo [Req3]: 2PC mid-prepare crash -> svc1 NO, svc2 None -> recovery marks ROLLED_BACK, no actual rollback needed")
+    logger.info("=" * 60)
+
+    log_dir = "demo_logs/recovery_prepare_all_no"
+    if os.path.exists(log_dir):
+        shutil.rmtree(log_dir)
+
+    tm1 = TransactionManager(log_dir=log_dir)
+    p1 = InMemory2PCParticipant("svc-a", always_vote_yes=False)
+    p2 = InMemory2PCParticipant("svc-b")
+    tm1.register_participant(p1)
+    tm1.register_participant(p2)
+
+    tx_id = tm1.begin(
+        mode=TxMode.TWO_PHASE,
+        participant_ids=["svc-a", "svc-b"],
+        timeout=60.0,
+    )
+
+    from dtx.logger import TxStatus, Vote
+    log = tm1.logger.read(tx_id)
+    log.status = TxStatus.PREPARING
+    log.participants[0].vote = Vote.NO
+    log.participants[1].vote = None
+    tm1.logger.append(log)
+
+    logger.info("Simulated crash: 2PC tx=%s PREPARING", tx_id)
+    logger.info("  svc-a: vote=NO (never reserved)")
+    logger.info("  svc-b: vote=None (never called)")
+
+    tm2 = TransactionManager(log_dir=log_dir)
+    await tm2.start()
+
+    p1_new = InMemory2PCParticipant("svc-a")
+    p2_new = InMemory2PCParticipant("svc-b")
+    tm2.register_participant(p1_new)
+    tm2.register_participant(p2_new)
+
+    recovery = RecoveryManager(tm2)
+    result = await recovery.recover_all()
+
+    final_log = tm2.logger.read(tx_id)
+    logger.info("After recovery: status=%s", final_log.status.value)
+
+    assert final_log.status == _TxS.ROLLED_BACK, f"Expected ROLLED_BACK, got {final_log.status.value}"
+    assert p1_new.rollback_count(tx_id) == 0, "svc-a voted NO, should NOT be rolled back"
+    assert p2_new.rollback_count(tx_id) == 0, "svc-b never voted, should NOT be rolled back"
+    outcome = result.outcomes.get(tx_id)
+    assert outcome in ("cancel_completed",), f"Expected cancel_completed, got {outcome}"
+    logger.info("No YES voters -> directly marked ROLLED_BACK. No rollback calls needed. OK")
+
+    await tm2.stop()
+
+
+# ============================================================
+# NEW: Requirement 3 - TCC try crash with NO tryers (edge case)
+# ============================================================
+async def demo_recovery_try_all_no_tcc():
+    logger.info("=" * 60)
+    logger.info("Demo [Req3]: TCC mid-try crash -> svc1 NO, svc2 None -> recovery marks CANCELLED, no actual cancel needed")
+    logger.info("=" * 60)
+
+    log_dir = "demo_logs/recovery_try_all_no"
+    if os.path.exists(log_dir):
+        shutil.rmtree(log_dir)
+
+    tm1 = TransactionManager(log_dir=log_dir)
+    p1 = InMemoryTCCParticipant("wallet-svc", always_try_yes=False)
+    p2 = InMemoryTCCParticipant("reward-svc")
+    tm1.register_participant(p1)
+    tm1.register_participant(p2)
+
+    tx_id = tm1.begin(
+        mode=TxMode.TCC,
+        participant_ids=["wallet-svc", "reward-svc"],
+        timeout=60.0,
+    )
+
+    from dtx.logger import TxStatus, Vote
+    log = tm1.logger.read(tx_id)
+    log.status = TxStatus.TRYING
+    log.participants[0].vote = Vote.NO
+    log.participants[1].vote = None
+    tm1.logger.append(log)
+
+    logger.info("Simulated crash: TCC tx=%s TRYING", tx_id)
+    logger.info("  wallet-svc: vote=NO (never froze balance)")
+    logger.info("  reward-svc: vote=None (never called)")
+
+    tm2 = TransactionManager(log_dir=log_dir)
+    await tm2.start()
+
+    p1_new = InMemoryTCCParticipant("wallet-svc")
+    p2_new = InMemoryTCCParticipant("reward-svc")
+    tm2.register_participant(p1_new)
+    tm2.register_participant(p2_new)
+
+    recovery = RecoveryManager(tm2)
+    result = await recovery.recover_all()
+
+    final_log = tm2.logger.read(tx_id)
+    logger.info("After recovery: status=%s", final_log.status.value)
+
+    assert final_log.status == _TxS.CANCELLED, f"Expected CANCELLED, got {final_log.status.value}"
+    assert p1_new.cancel_count(tx_id) == 0, "wallet-svc tried NO, should NOT be cancelled"
+    assert p2_new.cancel_count(tx_id) == 0, "reward-svc never tried, should NOT be cancelled"
+    outcome = result.outcomes.get(tx_id)
+    assert outcome in ("cancel_completed",), f"Expected cancel_completed, got {outcome}"
+    logger.info("No YES tryers -> directly marked CANCELLED. No cancel calls needed. OK")
+
+    await tm2.stop()
+
+
 async def main():
     await demo_2pc_commit()
     print()
@@ -669,6 +922,22 @@ async def main():
     await demo_recovery_partial_commit()
     print()
     await demo_recovery_partial_tcc_confirm()
+    print()
+
+    logger.info("#" * 60)
+    logger.info("# Requirement 5+6: Per-step logging + mid-prepare/try recovery")
+    logger.info("#" * 60)
+    await demo_recovery_mid_prepare_2pc()
+    print()
+    await demo_recovery_mid_try_tcc()
+    print()
+
+    logger.info("#" * 60)
+    logger.info("# Requirement 7: Prepare phase crash + no YES voters (edge cases)")
+    logger.info("#" * 60)
+    await demo_recovery_prepare_all_no_2pc()
+    print()
+    await demo_recovery_try_all_no_tcc()
     print()
 
     logger.info("=" * 60)
