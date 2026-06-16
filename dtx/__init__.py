@@ -1,5 +1,12 @@
 from .logger import TransactionLog, TransactionLogger, TxMode, TxStatus, Vote, ParticipantRecord
-from .participant import Participant, TCCParticipant, InMemory2PCParticipant, InMemoryTCCParticipant
+from .participant import (
+    Participant,
+    TCCParticipant,
+    InMemory2PCParticipant,
+    InMemoryTCCParticipant,
+    Failing2PCParticipant,
+    FailingTCCParticipant,
+)
 from .timeout import TimeoutDetector
 from .manager import TransactionManager, TransactionError
 from .recovery import RecoveryManager, RecoveryResult
@@ -15,6 +22,8 @@ __all__ = [
     "TCCParticipant",
     "InMemory2PCParticipant",
     "InMemoryTCCParticipant",
+    "Failing2PCParticipant",
+    "FailingTCCParticipant",
     "TimeoutDetector",
     "TransactionManager",
     "TransactionError",
