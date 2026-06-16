@@ -689,7 +689,7 @@ async def demo_recovery_mid_prepare_2pc():
 
     outcome = result.outcomes.get(tx_id)
     logger.info("Recovery outcome: %s", outcome)
-    assert outcome in ("cancel_completed",), f"Expected cancel_completed, got {outcome}"
+    assert outcome in ("prepare_compensated",), f"Expected prepare_compensated, got {outcome}"
     assert p2_new.rollback_count(tx_id) == 0, "svc-b never voted YES, should NOT be rolled back"
     logger.info("Only svc-a was rolled back (compensated). svc-b skipped (never voted YES). OK")
     logger.info("No orphaned reserved resources. All locks released. OK")
@@ -756,7 +756,7 @@ async def demo_recovery_mid_try_tcc():
 
     outcome = result.outcomes.get(tx_id)
     logger.info("Recovery outcome: %s", outcome)
-    assert outcome in ("cancel_completed",), f"Expected cancel_completed, got {outcome}"
+    assert outcome in ("try_compensated",), f"Expected try_compensated, got {outcome}"
     assert p2_new.cancel_count(tx_id) == 0, "reward-svc never tried YES, should NOT be cancelled"
     logger.info("Only wallet-svc was cancelled (frozen balance released). reward-svc skipped. OK")
     logger.info("No orphaned frozen resources. Business-level locks released. OK")
@@ -817,7 +817,7 @@ async def demo_recovery_prepare_all_no_2pc():
     assert p1_new.rollback_count(tx_id) == 0, "svc-a voted NO, should NOT be rolled back"
     assert p2_new.rollback_count(tx_id) == 0, "svc-b never voted, should NOT be rolled back"
     outcome = result.outcomes.get(tx_id)
-    assert outcome in ("cancel_completed",), f"Expected cancel_completed, got {outcome}"
+    assert outcome in ("rollback_completed",), f"Expected rollback_completed, got {outcome}"
     logger.info("No YES voters -> directly marked ROLLED_BACK. No rollback calls needed. OK")
 
     await tm2.stop()
@@ -882,6 +882,282 @@ async def demo_recovery_try_all_no_tcc():
     await tm2.stop()
 
 
+async def demo_stuck_then_recover_2pc():
+    logger.info("=" * 60)
+    logger.info("Demo [Req4.2]: 2PC - participant down -> 1st recovery STUCK -> service back -> 2nd recovery COMMITTED")
+    logger.info("=" * 60)
+
+    log_dir = "demo_logs/stuck_recover_2pc"
+    if os.path.exists(log_dir):
+        shutil.rmtree(log_dir)
+
+    tm = TransactionManager(log_dir=log_dir, default_timeout=60.0)
+    tm.set_participant_retry("svc-a", retry_max=2, retry_delay=0.1)
+    tm.set_participant_retry("svc-b", retry_max=1, retry_delay=0.05)
+    tm.set_participant_retry("svc-c", retry_max=2, retry_delay=0.1)
+    await tm.start()
+
+    p1 = InMemory2PCParticipant("svc-a")
+    p2 = Failing2PCParticipant("svc-b", fail_on_commit=True, fail_count=999)
+    p3 = InMemory2PCParticipant("svc-c")
+
+    tm.register_participant(p1)
+    tm.register_participant(p2)
+    tm.register_participant(p3)
+
+    tx_id = tm.begin(
+        mode=TxMode.TWO_PHASE,
+        participant_ids=["svc-a", "svc-b", "svc-c"],
+        timeout=60.0,
+    )
+
+    await tm.execute(tx_id, {"order": "ORD-200"})
+
+    final_log = tm.logger.read(tx_id)
+    logger.info("After execute: status=%s", final_log.status.value)
+    logger.info("  svc-a committed=%s, svc-b committed=%s, svc-c committed=%s",
+                p1.is_committed(tx_id), p2.is_committed(tx_id), p3.is_committed(tx_id))
+
+    assert final_log.status == _TxS.COMMITTING
+    assert p1.is_committed(tx_id)
+    assert not p2.is_committed(tx_id)
+    assert p3.is_committed(tx_id)
+    logger.info("Status=COMMITTING, svc-b stuck (still failing). OK")
+
+    await tm.stop()
+
+    logger.info("--- First recovery run (svc-b STILL DOWN) ---")
+    tm2 = TransactionManager(log_dir=log_dir, default_timeout=60.0)
+    tm2.set_participant_retry("svc-a", retry_max=2, retry_delay=0.1)
+    tm2.set_participant_retry("svc-b", retry_max=2, retry_delay=0.05)
+    tm2.set_participant_retry("svc-c", retry_max=2, retry_delay=0.1)
+    await tm2.start()
+
+    p1_r1 = InMemory2PCParticipant("svc-a")
+    p2_r1 = Failing2PCParticipant("svc-b", fail_on_commit=True, fail_count=999)
+    p3_r1 = InMemory2PCParticipant("svc-c")
+    tm2.register_participant(p1_r1)
+    tm2.register_participant(p2_r1)
+    tm2.register_participant(p3_r1)
+
+    recovery2 = RecoveryManager(tm2)
+    result1 = await recovery2.recover_all()
+
+    after_r1 = tm2.logger.read(tx_id)
+    logger.info("After 1st recovery: status=%s outcome=%s",
+                after_r1.status.value, result1.outcomes.get(tx_id))
+
+    assert after_r1.status == _TxS.COMMITTING, f"Expected still COMMITTING, got {after_r1.status.value}"
+    assert result1.outcomes.get(tx_id) == "still_failed", f"Expected still_failed, got {result1.outcomes.get(tx_id)}"
+    assert not p2_r1.is_committed(tx_id), "svc-b still not committed"
+    logger.info("1st recovery shows STUCK as expected. OK")
+
+    await tm2.stop()
+
+    logger.info("--- Second recovery run (svc-b BACK UP) ---")
+    tm3 = TransactionManager(log_dir=log_dir, default_timeout=60.0)
+    tm3.set_participant_retry("svc-a", retry_max=2, retry_delay=0.1)
+    tm3.set_participant_retry("svc-b", retry_max=3, retry_delay=0.05)
+    tm3.set_participant_retry("svc-c", retry_max=2, retry_delay=0.1)
+    await tm3.start()
+
+    p1_r2 = InMemory2PCParticipant("svc-a")
+    p2_r2 = InMemory2PCParticipant("svc-b")
+    p3_r2 = InMemory2PCParticipant("svc-c")
+    tm3.register_participant(p1_r2)
+    tm3.register_participant(p2_r2)
+    tm3.register_participant(p3_r2)
+
+    recovery3 = RecoveryManager(tm3)
+    result2 = await recovery3.recover_all()
+
+    after_r2 = tm3.logger.read(tx_id)
+    logger.info("After 2nd recovery: status=%s outcome=%s",
+                after_r2.status.value, result2.outcomes.get(tx_id))
+
+    assert after_r2.status == _TxS.COMMITTED, f"Expected COMMITTED, got {after_r2.status.value}"
+    assert result2.outcomes.get(tx_id) == "commit_completed", f"Expected commit_completed, got {result2.outcomes.get(tx_id)}"
+    assert p2_r2.is_committed(tx_id), "svc-b committed on 2nd recovery"
+    assert p1_r2.commit_count(tx_id) == 0, "svc-a not re-called (already done)"
+    assert p3_r2.commit_count(tx_id) == 0, "svc-c not re-called (already done)"
+    logger.info("2nd recovery converged to COMMITTED. OK")
+
+    await tm3.stop()
+
+
+async def demo_stuck_then_recover_tcc():
+    logger.info("=" * 60)
+    logger.info("Demo [Req4.2]: TCC - participant down -> 1st recovery STUCK -> service back -> 2nd recovery CONFIRMED")
+    logger.info("=" * 60)
+
+    log_dir = "demo_logs/stuck_recover_tcc"
+    if os.path.exists(log_dir):
+        shutil.rmtree(log_dir)
+
+    tm = TransactionManager(log_dir=log_dir, default_timeout=60.0)
+    tm.set_participant_retry("wallet", retry_max=1, retry_delay=0.05)
+    tm.set_participant_retry("inventory", retry_max=1, retry_delay=0.05)
+    tm.set_participant_retry("points", retry_max=1, retry_delay=0.05)
+    await tm.start()
+
+    p1 = InMemoryTCCParticipant("wallet")
+    p2 = FailingTCCParticipant("inventory", fail_on_confirm=True, fail_count=999)
+    p3 = InMemoryTCCParticipant("points")
+
+    tm.register_participant(p1)
+    tm.register_participant(p2)
+    tm.register_participant(p3)
+
+    tx_id = tm.begin(
+        mode=TxMode.TCC,
+        participant_ids=["wallet", "inventory", "points"],
+        timeout=60.0,
+    )
+
+    await tm.execute(tx_id, {"user": 42})
+
+    final_log = tm.logger.read(tx_id)
+    logger.info("After execute: status=%s", final_log.status.value)
+    logger.info("  wallet confirmed=%s, inventory confirmed=%s, points confirmed=%s",
+                p1.is_confirmed(tx_id), p2.is_confirmed(tx_id), p3.is_confirmed(tx_id))
+
+    assert final_log.status == _TxS.CONFIRMING
+    assert p1.is_confirmed(tx_id)
+    assert not p2.is_confirmed(tx_id)
+    assert p3.is_confirmed(tx_id)
+    logger.info("Status=CONFIRMING, inventory stuck (still failing). OK")
+
+    await tm.stop()
+
+    logger.info("--- First recovery run (inventory STILL DOWN) ---")
+    tm2 = TransactionManager(log_dir=log_dir, default_timeout=60.0)
+    tm2.set_participant_retry("wallet", retry_max=1, retry_delay=0.05)
+    tm2.set_participant_retry("inventory", retry_max=2, retry_delay=0.05)
+    tm2.set_participant_retry("points", retry_max=1, retry_delay=0.05)
+    await tm2.start()
+
+    p1_r1 = InMemoryTCCParticipant("wallet")
+    p2_r1 = FailingTCCParticipant("inventory", fail_on_confirm=True, fail_count=999)
+    p3_r1 = InMemoryTCCParticipant("points")
+    tm2.register_participant(p1_r1)
+    tm2.register_participant(p2_r1)
+    tm2.register_participant(p3_r1)
+
+    recovery2 = RecoveryManager(tm2)
+    result1 = await recovery2.recover_all()
+
+    after_r1 = tm2.logger.read(tx_id)
+    logger.info("After 1st recovery: status=%s outcome=%s",
+                after_r1.status.value, result1.outcomes.get(tx_id))
+
+    assert after_r1.status == _TxS.CONFIRMING
+    assert result1.outcomes.get(tx_id) == "still_failed"
+    assert not p2_r1.is_confirmed(tx_id)
+    logger.info("1st recovery shows STUCK as expected. OK")
+
+    await tm2.stop()
+
+    logger.info("--- Second recovery run (inventory BACK UP) ---")
+    tm3 = TransactionManager(log_dir=log_dir, default_timeout=60.0)
+    tm3.set_participant_retry("wallet", retry_max=1, retry_delay=0.05)
+    tm3.set_participant_retry("inventory", retry_max=2, retry_delay=0.05)
+    tm3.set_participant_retry("points", retry_max=1, retry_delay=0.05)
+    await tm3.start()
+
+    p1_r2 = InMemoryTCCParticipant("wallet")
+    p2_r2 = InMemoryTCCParticipant("inventory")
+    p3_r2 = InMemoryTCCParticipant("points")
+    tm3.register_participant(p1_r2)
+    tm3.register_participant(p2_r2)
+    tm3.register_participant(p3_r2)
+
+    recovery3 = RecoveryManager(tm3)
+    result2 = await recovery3.recover_all()
+
+    after_r2 = tm3.logger.read(tx_id)
+    logger.info("After 2nd recovery: status=%s outcome=%s",
+                after_r2.status.value, result2.outcomes.get(tx_id))
+
+    assert after_r2.status == _TxS.CONFIRMED, f"Expected CONFIRMED, got {after_r2.status.value}"
+    assert result2.outcomes.get(tx_id) == "confirm_completed"
+    assert p2_r2.is_confirmed(tx_id)
+    assert p1_r2.confirm_count(tx_id) == 0, "wallet not re-called"
+    assert p3_r2.confirm_count(tx_id) == 0, "points not re-called"
+    logger.info("2nd recovery converged to CONFIRMED. OK")
+
+    await tm3.stop()
+
+
+async def demo_per_participant_retry_config():
+    logger.info("=" * 60)
+    logger.info("Demo [Req4.3]: Per-participant retry config — different max retries, backoff visible in recovery output")
+    logger.info("=" * 60)
+
+    log_dir = "demo_logs/per_participant_retry"
+    if os.path.exists(log_dir):
+        shutil.rmtree(log_dir)
+
+    tm = TransactionManager(log_dir=log_dir, default_timeout=60.0)
+    tm.set_participant_retry("fast-svc", retry_max=1, retry_delay=0.05)
+    tm.set_participant_retry("slow-svc", retry_max=3, retry_delay=0.02)
+    tm.set_participant_retry("med-svc", retry_max=2, retry_delay=0.03)
+    await tm.start()
+
+    p1 = InMemory2PCParticipant("fast-svc")
+    p2 = Failing2PCParticipant("slow-svc", fail_on_commit=True, fail_count=999)
+    p3 = InMemory2PCParticipant("med-svc")
+
+    tm.register_participant(p1)
+    tm.register_participant(p2)
+    tm.register_participant(p3)
+
+    tx_id = tm.begin(
+        mode=TxMode.TWO_PHASE,
+        participant_ids=["fast-svc", "slow-svc", "med-svc"],
+        timeout=60.0,
+    )
+
+    await tm.execute(tx_id, {"order": "ORD-300"})
+
+    after_exe = tm.logger.read(tx_id)
+    logger.info("After execute: status=%s", after_exe.status.value)
+    assert after_exe.status == _TxS.COMMITTING
+    await tm.stop()
+
+    tm2 = TransactionManager(log_dir=log_dir, default_timeout=60.0)
+    tm2.set_participant_retry("fast-svc", retry_max=1, retry_delay=0.05)
+    tm2.set_participant_retry("slow-svc", retry_max=3, retry_delay=0.02)
+    tm2.set_participant_retry("med-svc", retry_max=2, retry_delay=0.03)
+    await tm2.start()
+
+    p1_r1 = InMemory2PCParticipant("fast-svc")
+    p2_r1 = Failing2PCParticipant("slow-svc", fail_on_commit=True, fail_count=999)
+    p3_r1 = InMemory2PCParticipant("med-svc")
+    tm2.register_participant(p1_r1)
+    tm2.register_participant(p2_r1)
+    tm2.register_participant(p3_r1)
+
+    recovery = RecoveryManager(tm2)
+    result = await recovery.recover_all()
+
+    attempts = result.participant_attempts.get(tx_id, [])
+    for pa in attempts:
+        logger.info("  Participant %s: action=%s attempts=%s succeeded=%s error=%s",
+                    pa.participant_id, pa.action, pa.attempts, pa.succeeded, pa.final_error)
+
+    slow_attempt = next((a for a in attempts if a.participant_id == "slow-svc"), None)
+    assert slow_attempt is not None, "slow-svc should have attempt record"
+    assert slow_attempt.attempts == 3, f"slow-svc should have 3 attempts (retry_max=3), got {slow_attempt.attempts}"
+    assert not slow_attempt.succeeded
+
+    fast_attempt = next((a for a in attempts if a.participant_id == "fast-svc"), None)
+    if fast_attempt and fast_attempt.succeeded:
+        assert fast_attempt.attempts in (1, None), f"fast-svc succeeds immediately"
+
+    logger.info("Per-participant retry config honored: slow-svc retried 3 times. OK")
+    await tm2.stop()
+
+
 async def main():
     await demo_2pc_commit()
     print()
@@ -938,6 +1214,20 @@ async def main():
     await demo_recovery_prepare_all_no_2pc()
     print()
     await demo_recovery_try_all_no_tcc()
+    print()
+
+    logger.info("#" * 60)
+    logger.info("# Requirement 8: Fail -> stuck -> recover -> converge")
+    logger.info("#" * 60)
+    await demo_stuck_then_recover_2pc()
+    print()
+    await demo_stuck_then_recover_tcc()
+    print()
+
+    logger.info("#" * 60)
+    logger.info("# Requirement 9: Per-participant retry config with attempt tracking")
+    logger.info("#" * 60)
+    await demo_per_participant_retry_config()
     print()
 
     logger.info("=" * 60)

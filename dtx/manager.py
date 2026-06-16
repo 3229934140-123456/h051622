@@ -34,13 +34,52 @@ class TransactionManager:
         self._active_tx: Dict[str, TransactionLog] = {}
         self._timeout = TimeoutDetector(check_interval=timeout_check_interval)
         self._timeout.set_callback(self._on_timeout)
-        self._retry_max = 3
-        self._retry_delay = 0.5
+        self._default_retry_max = 3
+        self._default_retry_delay = 0.5
+        self._retry_config: Dict[str, dict] = {}
         self._aborted_tx: Set[str] = set()
         self._inflight_tx: Dict[str, asyncio.Event] = {}
+        self._last_attempts: Dict[str, int] = {}
+        self._pending_failures: Dict[str, list] = {}
 
-    def register_participant(self, participant: Participant) -> None:
+    def set_participant_retry(
+        self,
+        participant_id: str,
+        retry_max: int = 3,
+        retry_delay: float = 0.5,
+    ) -> None:
+        self._retry_config[participant_id] = {
+            "retry_max": retry_max,
+            "retry_delay": retry_delay,
+        }
+        logger.info(
+            "Participant retry configured: %s retry_max=%d retry_delay=%.2fs",
+            participant_id, retry_max, retry_delay,
+        )
+
+    def _get_retry_config(self, participant_id: str) -> dict:
+        cfg = self._retry_config.get(participant_id)
+        if cfg:
+            return cfg
+        return {
+            "retry_max": self._default_retry_max,
+            "retry_delay": self._default_retry_delay,
+        }
+
+    def register_participant(
+        self,
+        participant: Participant,
+        *,
+        retry_max: Optional[int] = None,
+        retry_delay: Optional[float] = None,
+    ) -> None:
         self._participants[participant.participant_id] = participant
+        if retry_max is not None or retry_delay is not None:
+            self.set_participant_retry(
+                participant.participant_id,
+                retry_max=retry_max or self._default_retry_max,
+                retry_delay=retry_delay or self._default_retry_delay,
+            )
         logger.info("Participant registered: %s", participant.participant_id)
 
     def unregister_participant(self, participant_id: str) -> None:
@@ -457,6 +496,7 @@ class TransactionManager:
             logger.error(
                 "Participant not found for %s: %s", action, participant_id
             )
+            self._record_failure(tx_id, participant_id, action, 0, "Participant not found")
             return False
 
         method = getattr(participant, action, None)
@@ -464,38 +504,64 @@ class TransactionManager:
             logger.error(
                 "Action %s not supported by participant %s", action, participant_id
             )
+            self._record_failure(tx_id, participant_id, action, 0, f"Action {action} not supported")
             return False
 
-        for attempt in range(1, self._retry_max + 1):
+        cfg = self._get_retry_config(participant_id)
+        retry_max = cfg["retry_max"]
+        retry_delay = cfg["retry_delay"]
+        last_error = None
+
+        for attempt in range(1, retry_max + 1):
             try:
                 await method(tx_id, context)
+                self._last_attempts[participant_id] = attempt
                 logger.info(
-                    "Action succeeded: tx=%s participant=%s action=%s attempt=%d",
+                    "Action succeeded: tx=%s participant=%s action=%s attempt=%d/%d",
                     tx_id,
                     participant_id,
                     action,
                     attempt,
+                    retry_max,
                 )
                 return True
             except Exception as exc:
+                last_error = str(exc)
                 logger.warning(
                     "Action failed (retry %d/%d): tx=%s participant=%s action=%s error=%s",
                     attempt,
-                    self._retry_max,
+                    retry_max,
                     tx_id,
                     participant_id,
                     action,
                     exc,
                 )
-                if attempt < self._retry_max:
-                    await asyncio.sleep(self._retry_delay * attempt)
+                if attempt < retry_max:
+                    await asyncio.sleep(retry_delay * attempt)
+
+        self._last_attempts[participant_id] = retry_max
+        self._record_failure(tx_id, participant_id, action, retry_max, last_error)
         logger.error(
-            "Action exhausted retries: tx=%s participant=%s action=%s",
+            "Action exhausted retries (%d): tx=%s participant=%s action=%s",
+            retry_max,
             tx_id,
             participant_id,
             action,
         )
         return False
+
+    def _record_failure(
+        self, tx_id: str, participant_id: str, action: str, attempts: int, error: str
+    ) -> None:
+        self._pending_failures.setdefault(tx_id, []).append(
+            (participant_id, action, attempts, error)
+        )
+
+    def consume_pending_failures(self, tx_id: str) -> list:
+        return self._pending_failures.pop(tx_id, [])
+
+    def get_last_attempt_count(self, participant_id: str) -> Optional[int]:
+        return self._last_attempts.get(participant_id)
 
     def _finalize(self, tx_id: str) -> None:
         self._timeout.unregister(tx_id)
@@ -560,6 +626,13 @@ class TransactionManager:
 
     def get_log(self, tx_id: str) -> Optional[TransactionLog]:
         return self._active_tx.get(tx_id) or self._tx_logger.read(tx_id)
+
+    def list_unconverged(self) -> list:
+        result = []
+        for log in self._tx_logger.list_all():
+            if not self._tx_logger.is_terminal(log.status):
+                result.append(log)
+        return result
 
     @property
     def logger(self) -> TransactionLogger:
