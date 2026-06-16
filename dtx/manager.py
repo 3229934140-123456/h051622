@@ -200,10 +200,55 @@ class TransactionManager:
                 )
                 continue
 
+            if self._is_aborted(tx_id) and vote == Vote.YES:
+                logger.warning(
+                    "2PC prepare: slow participant %s voted YES after timeout, "
+                    "immediately rolling back to release reserved resources: tx=%s",
+                    prec.participant_id, tx_id,
+                )
+                try:
+                    await self._invoke_with_retry(
+                        tx_id, prec.participant_id, "rollback", context
+                    )
+                    prec.phase_completed = "rollback"
+                    self._tx_logger.append(log)
+                    logger.info(
+                        "Slow participant %s rolled back (resources released): tx=%s",
+                        prec.participant_id, tx_id,
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "Failed to rollback late slow participant %s: tx=%s error=%s",
+                        prec.participant_id, tx_id, exc,
+                    )
+                continue
+
             if vote != Vote.YES:
                 all_yes = False
 
         if self._is_aborted(tx_id):
+            late_yes = [
+                p for p in log.participants
+                if p.vote == Vote.YES and p.phase_completed != "rollback"
+            ]
+            if late_yes:
+                logger.warning(
+                    "2PC aborted after prepare, %d late YES voters need "
+                    "compensation: tx=%s late_yes=%s",
+                    len(late_yes), tx_id, [p.participant_id for p in late_yes],
+                )
+                for p in late_yes:
+                    try:
+                        await self._invoke_with_retry(
+                            tx_id, p.participant_id, "rollback", context
+                        )
+                        p.phase_completed = "rollback"
+                    except Exception as exc:
+                        logger.error(
+                            "Late compensation failed: tx=%s participant=%s error=%s",
+                            tx_id, p.participant_id, exc,
+                        )
+                self._tx_logger.append(log)
             logger.warning(
                 "2PC aborted after prepare, timeout handler will take over: tx=%s",
                 tx_id,
